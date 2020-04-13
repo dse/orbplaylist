@@ -1,0 +1,247 @@
+#!/usr/bin/env perl
+use warnings;
+use strict;
+
+use open IO => ":locale";
+
+use File::Basename qw(basename);
+our $PROGNAME = basename($0);
+
+our $archive = 0;
+our $test    = 0;
+our $verbose = 0;
+our $days    = undef;
+our $quiet   = 0;
+
+use Getopt::Long qw();
+Getopt::Long::Configure('bundling', 'gnu_compat', 'no_ignore_case');
+Getopt::Long::GetOptions(
+    'q|quiet'    => \$quiet,
+    'a|archive'  => \$archive,
+    't|test'     => \$test,
+    'v|verbose+' => \$verbose,
+    'd|days=i'   => \$days,
+    'h|help'     => sub { usage(); exit(0); },
+);
+
+sub usage { print <<"END"; }
+usage:
+    $PROGNAME [<option> ...] <country>/<stationid> [<days>]
+options:
+    -a, --archive
+    -v, --verbose
+    -d, --days=<int>
+    -h, --help
+    -q, --quiet
+END
+
+if (!scalar @ARGV) {
+    die("$PROGNAME: station Id must be specified\n");
+}
+
+my ($stationId) = grep { !m{^\d+$} } @ARGV;
+my @days        = grep { m{^\d+$} } @ARGV;
+
+our $pl = My::OnlineRadioBox::Playlist->new();
+$pl->stationId($stationId);
+$pl->verbose($verbose);
+$pl->isArchiving($archive);
+$pl->isTesting($test);
+$pl->isQuiet($quiet);
+if (defined $days) {
+    $pl->run($days);
+}
+if (scalar @days) {
+    foreach my $days (@days) {
+        $pl->run($days);
+    }
+}
+
+package My::OnlineRadioBox::Playlist {
+    use File::Basename qw(basename);
+    our $PROGNAME; BEGIN { $PROGNAME = basename($0); }
+
+    use feature               qw(say);
+    use LWP::UserAgent        qw();
+    use HTML::Tree            qw();
+    use File::Path            qw(make_path);
+    use POSIX                 qw(strftime tzset);
+    use Data::Dumper          qw(Dumper);
+    use Time::ParseDate       qw(parsedate);
+    use File::Basename        qw(dirname);
+
+    use Moo;
+    INIT {
+        has 'stationId'   => (is => 'rw');
+        has 'ua'          => (is => 'rw', lazy => 1, default => sub { return LWP::UserAgent->new(); });
+        has 'verbose'     => (is => 'rw', default => 0);
+        has 'isArchiving' => (is => 'rw', default => 0);
+        has 'isTesting'   => (is => 'rw', default => 0);
+        has 'isQuiet'     => (is => 'rw', default => 0);
+    }
+
+    sub run {
+        my ($self, $days) = @_;
+        if ($days < 0 || $days > 6) {
+            if ($self->verbose) {
+                warn("$PROGNAME: cannot fetch data from $days days ago\n");
+            }
+            return;
+        }
+        my $data = $self->getPlaylistData($days);
+        $self->printPlaylistData($data);
+        if ($self->isArchiving) {
+            $self->savePlaylistData($data);
+        }
+    }
+
+    sub printPlaylistData {
+        my ($self, $data) = @_;
+        if ($self->isQuiet) {
+            return;
+        }
+        foreach my $song (@{$data->{songs}}) {
+            say $song->{line};
+        }
+    }
+
+    # returns a hash
+    sub getPlaylistData {
+        my ($self, $days) = @_;
+        my $url = $self->pageURL($days);
+        warn("$PROGNAME: fetching $url\n") if $self->verbose;
+        my $response = $self->ua->get($url);
+        if ($self->verbose) {
+            my $statusLine = $response->status_line;
+            warn("$PROGNAME: => $statusLine\n") if $self->verbose;
+        }
+        if (!$response->is_success) {
+            return;
+        }
+        my $tree = HTML::TreeBuilder->new();
+        $tree->parse($response->decoded_content());
+        $tree->eof();
+
+        my @songs = $self->getPlaylistSongs($tree);
+        my $date = $self->getPlaylistDate($tree);
+        my $dateFormatted = strftime('%a %Y-%m-%d', localtime($date));
+        foreach my $song (@songs) {
+            $song->{line} = sprintf("%s %s\t%s", $dateFormatted, $song->{time}, $song->{song});
+        }
+
+        my $data = {
+            songs         => \@songs,
+            date          => $date,
+            dateFormatted => $dateFormatted,
+            days          => $days,
+        };
+        return $data;
+    }
+
+    sub getPlaylistSongs {
+        my ($self, $tree) = @_;
+        my @table = $tree->look_down('_tag' => 'table', 'class' => qr{(?:^|\s)tablelist-schedule(?:$|\s)});
+        my @songs = ();
+        foreach my $table (@table) {
+            my @tr = $table->look_down('_tag' => 'tr');
+            foreach my $tr (@tr) {
+                my @td = $tr->content_list();
+                my @text = map { $_->as_text_trimmed() } @td;
+                next if scalar @text < 2;
+                next unless $text[0] =~ m{\S};
+                next unless $text[1] =~ m{\S};
+                next if lc($text[0]) eq 'live';
+                next if $text[0] !~ m{^\d+:\d+(?::\d+)?$};
+                push(@songs, {
+                    time => $text[0],
+                    song => $text[1],
+                    data => \@text,
+                });
+            }
+        }
+        return @songs;
+    }
+
+    sub getPlaylistDate {
+        my ($self, $tree) = @_;
+        my @ul = $tree->look_down('_tag' => 'ul', 'class' => qr{(?:^|\s)playlist__schedule(?:$|\s)});
+        foreach my $ul (@ul) {
+            my ($li) = $ul->look_down(
+                '_tag' => 'li',
+                'class' => qr{(?:^|\s)active(?:$|\s)}
+            );
+            next unless $li;
+            my $dateString = $li->as_text_trimmed();
+            if ($dateString =~ m{\b(\d{1,2})\.(\d{1,2})\b}) {
+                my ($date, $month) = ((0 + $1), (0 + $2));
+                my $newDateString = sprintf('%02d/%02d', $month, $date);
+                my $finalDate = $self->parseNearestDate($newDateString);
+                return $finalDate;
+            }
+        }
+        return;
+    }
+
+    # takes a hash
+    sub savePlaylistData {
+        my ($self, $data) = @_;
+        if (!$data->{days}) {
+            warn("$PROGNAME: not archiving today's playlist data\n");
+            return;
+        }
+        if (!scalar @{$data->{songs}}) {
+            warn("$PROGNAME: no data to speak of for $data->{dateFormatted}\n") if $self->verbose;
+            return;
+        }
+        my $filename = $self->playlistDataFilename($data);
+        if (-e $filename) {
+            warn("$PROGNAME: $filename already exists\n") if $self->verbose;
+            return;
+        }
+        make_path(dirname($filename));
+        my $fh;
+        open($fh, '>', $filename) or die("$PROGNAME: cannot write $filename: $!\n");
+        foreach my $song (@{$data->{songs}}) {
+            say $fh $song->{line};
+        }
+        close($fh);
+        warn("$PROGNAME: wrote $filename\n") if $self->verbose;
+    }
+
+    sub pageURL {
+        my ($self, $days) = @_;
+        return sprintf('https://onlineradiobox.com/%s/playlist/%d', $self->stationId, $days) if $days;
+        return sprintf('https://onlineradiobox.com/%s/playlist/',   $self->stationId);
+    }
+
+    sub parseNearestDate {
+        my ($self, $dateString) = @_;
+        my $time_t_now = time();
+        my $this_year     = 0 + strftime('%Y', localtime($time_t_now));
+        my $previous_year = $this_year - 1;
+        my $next_year     = $this_year + 1;
+        my $time_t_1 = parsedate("$dateString 12:00:00", NOW => parsedate(sprintf('%04d-07-01 12:00:00', $previous_year)));
+        my $time_t_2 = parsedate("$dateString 12:00:00", NOW => parsedate(sprintf('%04d-07-01 12:00:00', $this_year)));
+        my $time_t_3 = parsedate("$dateString 12:00:00", NOW => parsedate(sprintf('%04d-07-01 12:00:00', $next_year)));
+        my $diff_1 = abs($time_t_now - $time_t_1);
+        my $diff_2 = abs($time_t_now - $time_t_2);
+        my $diff_3 = abs($time_t_now - $time_t_3);
+        my ($diff_closest) = sort { $a <=> $b } ($diff_1, $diff_2, $diff_3);
+        return $time_t_1 if $diff_closest == $diff_1;
+        return $time_t_2 if $diff_closest == $diff_2;
+        return $time_t_3 if $diff_closest == $diff_3;
+        die("$PROGNAME: UNEXPECTED: parseNearestTime\n");
+    }
+
+    sub baseDir {
+        my ($self) = @_;
+        return sprintf("$ENV{HOME}/.orbplaylist/%s", $self->stationId);
+    }
+
+    sub playlistDataFilename {
+        my ($self, $data) = @_;
+        my $baseDir = $self->baseDir;
+        return strftime("$baseDir/%Y/%m/%Y-%m-%d.tsv",
+                        localtime($data->{date}));
+    }
+};
